@@ -75,7 +75,6 @@ try:
         """))
         
         # إزالة القيد الفريد القديم على telegram_message_id إذا كان موجوداً (لأنه سيتعارض مع الجديد)
-        # نستخدم كتلة try/except لأن القيد قد لا يكون موجوداً
         try:
             conn.execute(text("ALTER TABLE episodes DROP CONSTRAINT IF EXISTS episodes_telegram_message_id_key"))
             print("✅ تم إزالة القيد الفريد القديم على telegram_message_id.")
@@ -344,56 +343,47 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
         print(f"❌ خطأ في قاعدة البيانات: {e}")
         return False
 
-def delete_from_database(message_id, channel_id=None):
-    """حذف حلقة/جزء من قاعدة البيانات عند حذفها من القناة."""
+def delete_from_database(message_id, channel_id):
+    """حذف حلقة/جزء من قاعدة البيانات عند حذفها من القناة باستخدام message_id و channel_id."""
+    if not channel_id:
+        print(f"⚠️ لم يتم توفير channel_id للحذف، لن يتم حذف الرسالة {message_id}")
+        return False
+
     try:
         with engine.begin() as conn:
-            # البحث عن الحلقة المراد حذفها (نحتاج channel_id لتحديدها بدقة)
-            if channel_id:
-                # إذا كان لدينا channel_id، نستخدمه مع message_id
-                episode_result = conn.execute(
-                    text("""
-                        SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number, e.telegram_channel_id
-                        FROM episodes e
-                        JOIN series s ON e.series_id = s.id
-                        WHERE e.telegram_message_id = :msg_id AND e.telegram_channel_id = :channel
-                    """),
-                    {"msg_id": message_id, "channel": channel_id}
-                ).fetchone()
-            else:
-                # للتوافق مع الإصدارات السابقة، نبحث بالرسالة فقط (قد يكون هناك عدة)
-                episode_result = conn.execute(
-                    text("""
-                        SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number, e.telegram_channel_id
-                        FROM episodes e
-                        JOIN series s ON e.series_id = s.id
-                        WHERE e.telegram_message_id = :msg_id
-                    """),
-                    {"msg_id": message_id}
-                ).fetchone()
-            
+            # البحث باستخدام المفتاح المركب (channel_id, message_id)
+            episode_result = conn.execute(
+                text("""
+                    SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number
+                    FROM episodes e
+                    JOIN series s ON e.series_id = s.id
+                    WHERE e.telegram_message_id = :msg_id AND e.telegram_channel_id = :channel
+                """),
+                {"msg_id": message_id, "channel": channel_id}
+            ).fetchone()
+
             if not episode_result:
-                print(f"⚠️ لم يتم العثور على الحلقة {message_id} في قاعدة البيانات")
+                print(f"⚠️ لم يتم العثور على الحلقة {message_id} في القناة {channel_id}")
                 return False
-            
-            episode_id, series_id, name, content_type, season, episode_num, channel_id = episode_result
-            
+
+            episode_id, series_id, name, content_type, season, episode_num = episode_result
+
             # حذف الحلقة
             conn.execute(
                 text("DELETE FROM episodes WHERE id = :episode_id"),
                 {"episode_id": episode_id}
             )
-            
+
             # التحقق مما إذا كان المسلسل/الفيلم لا يزال لديه حلقات أخرى
             remaining_episodes = conn.execute(
                 text("SELECT COUNT(*) FROM episodes WHERE series_id = :series_id"),
                 {"series_id": series_id}
             ).scalar()
-            
+
             type_arabic = "مسلسل" if content_type == 'series' else "فيلم"
-            
+
             if remaining_episodes == 0:
-                # إذا لم يعد هناك حلقات، حذف المسلسل/الفيلم أيضًا
+                # حذف المسلسل/الفيلم بالكامل
                 conn.execute(
                     text("DELETE FROM series WHERE id = :series_id"),
                     {"series_id": series_id}
@@ -404,9 +394,9 @@ def delete_from_database(message_id, channel_id=None):
                     print(f"🗑️ تم حذف {type_arabic}: {name} - الجزء {season} من {channel_id}")
                 else:
                     print(f"🗑️ تم حذف {type_arabic}: {name} - الموسم {season} الحلقة {episode_num} من {channel_id}")
-            
+
             return True
-            
+
     except SQLAlchemyError as e:
         print(f"❌ خطأ في حذف من قاعدة البيانات: {e}")
         return False
@@ -449,7 +439,6 @@ async def check_deleted_messages(client, channel):
                 print(f"   تم العثور على {len(deleted_ids)} رسالة محذوفة في {channel.title}")
                 for msg_id in deleted_ids:
                     print(f"   🗑️ معالجة الرسالة المحذوفة: {msg_id}")
-                    # نمرر channel_id لتحديد الحلقة بدقة
                     delete_from_database(msg_id, channel_id)
             else:
                 print(f"   ✅ لا توجد رسائل محذوفة في {channel.title}")
@@ -579,12 +568,44 @@ async def monitor_channels():
         # مراقبة حذف الرسائل من جميع القنوات
         @client.on(events.MessageDeleted(chats=channel_entities))
         async def delete_handler(event):
-            # لسنا متأكدين من القناة التي حدث فيها الحذف، لذا نستخدم الدالة القديمة (بدون channel_id)
-            # ولكن يمكن تحسين ذلك إذا أمكن الحصول على القناة من الحدث
+            # محاولة الحصول على معرف القناة من الحدث بطرق مختلفة
+            chat_id = None
+
+            # الطريقة المباشرة: event.chat_id (متاح في Telethon 1.x)
+            if hasattr(event, 'chat_id') and event.chat_id:
+                chat_id = event.chat_id
+            # الطريقة عبر event.chat (قد يكون محملاً)
+            elif hasattr(event, 'chat') and event.chat:
+                chat_id = event.chat.id
+            # محاولة الحصول من event.original_update (في بعض الإصدارات)
+            elif hasattr(event, 'original_update') and hasattr(event.original_update, 'channel_id'):
+                chat_id = event.original_update.channel_id
+
+            if not chat_id:
+                print("⚠️ تعذر الحصول على معرف القناة في حدث الحذف. لن يتم حذف السجلات.")
+                return
+
+            # البحث عن القناة المقابلة في قائمة channel_entities
+            channel_entity = None
+            for ch in channel_entities:
+                if ch.id == chat_id:
+                    channel_entity = ch
+                    break
+
+            if not channel_entity:
+                print(f"⚠️ لم يتم العثور على قناة بالمعرف {chat_id} في القائمة. لن يتم حذف السجلات.")
+                return
+
+            # تحويل الكيان إلى الصيغة المستخدمة في قاعدة البيانات
+            if hasattr(channel_entity, 'username') and channel_entity.username:
+                channel_id = f"@{channel_entity.username}"
+            else:
+                channel_id = str(channel_entity.id)
+
+            # معالجة كل رسالة محذوفة
             for msg_id in event.deleted_ids:
-                print(f"🗑️ تم حذف رسالة: {msg_id}")
-                # نمرر None للـ channel_id، وستبحث الدالة عن أي حلقة بهذا المعرف
-                delete_from_database(msg_id, None)
+                print(f"🗑️ تم حذف رسالة: {msg_id} من القناة {channel_id}")
+                delete_from_database(msg_id, channel_id)
         
         print("\n🎯 جاهز لمراقبة القنوات:")
         for i, chan in enumerate(channel_entities, 1):
